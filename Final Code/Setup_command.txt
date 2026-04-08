@@ -1,0 +1,76 @@
+RPI Install:
+sudo apt update
+sudo apt full-upgrade
+sudo apt install python3 python3-pip python3-venv
+sudo apt install python3-opencv
+sudo apt install python3-picamera2 libcamera-apps
+sudo apt install libjpeg-dev libtiff5-dev libpng-dev
+sudo reboot
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install flask numpy gpiozero pigpio
+
+
+
+
+
+OPI Install:
+sudo apt update
+sudo apt full-upgrade
+sudo apt-get update
+sudo apt-get -y install git swig python3-dev python3-setuptools
+git clone --recursive https://github.com/orangepi-xunlong/wiringOP-Python -b next
+cd wiringOP-Python
+git submodule update --init --remote
+python3 generate-bindings.py > bindings.i
+sudo python3 setup.py install
+sudo apt install python3 python3-pip python3-venv
+sudo apt install python3-opencv
+sudo apt install libjpeg-dev libtiff5-dev libpng-dev
+sudo reboot
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install flask numpy gpiozero pigpio
+
+Run Program:
+cd ~/FYP
+sudo python3 main.py
+
+
+VNC:
+sudo apt install xfce4 xfce4-goodies -y
+sudo apt install tightvncserver -y
+vncserver
+vncserver -kill :1
+nano ~/.vnc/xstartup
+
+#!/bin/sh					<--- Input this part
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+autocutsel -s CLIPBOARD -fork 
+startxfce4 &
+
+vncserver :1 -geometry 1280x720
+
+Auto-start VNC:
+sudo nano /etc/rc.local
+
+su - orangepi -c 'vncserver :1 -geometry 1280x720' &		<--- Add it and reboot
+exit 0
+
+sudo chmod +x /etc/rc.local
+
+VNC Transfer file:
+python3 -m http.server 8000		<--- Then, on computer's browser, http://192.168.1.150:8000
+
+Easy run Program:
+nano ~/.bashrc
+alias runfyp='sudo python3 /home/orangepi/FYP/main2.py'		<--- Add this line at the end
+source ~/.bashrc
+
+No Password for Sudo:
+sudo visudo
+orangepi ALL=(ALL) NOPASSWD: /usr/bin/python3		<--- Modify 
+

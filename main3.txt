@@ -1,0 +1,620 @@
+from flask import Flask, render_template, Response, request, jsonify
+import cv2
+import numpy as np
+import threading
+from time import sleep
+import time
+import logging
+import os
+import sys
+import signal
+from queue import Queue, Empty  # for motor command queue
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+CANDIDATE_INDICES = [0, 1, 2, 3, 4]
+multi_thresholds = [
+    ((160, 100, 49), (180, 255, 255)),
+]
+
+# You can change to (640, 480) if CPU is strong enough
+RESOLUTION = (640, 480)
+frame_size = RESOLUTION
+fps = 30
+
+last_motor_time = 0
+motor_cooldown = 0.3
+motor_speed = 0.5
+app = Flask(__name__)
+
+move_speed = 0.5
+joystick_active = False
+joystick_direction = None
+joystick_lock = threading.Lock()
+
+ai_tracking_active = False
+ai_tracking_lock = threading.Lock()
+recording_active = False
+recording_lock = threading.Lock()
+forward_moving = False
+forward_lock = threading.Lock()
+video_filename = "output.avi"
+
+PWM_PINS = {
+    32: {"name": "PI11/PWM1", "chip": 0, "channel": 1},
+    33: {"name": "PI12/PWM2", "chip": 0, "channel": 2},
+    7:  {"name": "PI13/PWM3", "chip": 0, "channel": 3},
+    16: {"name": "PI14/PWM4", "chip": 0, "channel": 4},
+}
+
+# Motor command queue + worker flag
+motor_queue = Queue(maxsize=1)
+motor_worker_running = True
+
+
+def open_camera_with_settings(index, width, height):
+    """force MJPG + resolution + low buffer"""
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    if not cap.isOpened():
+        cap.release()
+        return None
+
+    ret, frame = cap.read()
+    if ret and frame is not None and frame.size > 0:
+        return cap
+    cap.release()
+    return None
+
+
+def find_active_camera(width, height):
+    for index in CANDIDATE_INDICES:
+        logging.info(f"[*] Trying /dev/video{index} @ {width}x{height} ...")
+        cap = open_camera_with_settings(index, width, height)
+        if cap:
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            logging.info(f" [SUCCESS] Connected to video{index}, actual: {actual_w}x{actual_h}")
+            return cap, index
+    return None, None
+
+
+class CameraManager:
+    def __init__(self):
+        self.cap = None
+        self.latest_frame = None   # BGR frame (original)
+        self.latest_mask = None    # latest AI mask (GRAY)
+        self.latest_det = None     # latest AI detection (BGR)
+        self.lock = threading.Lock()
+        self.running = True
+        self._start()
+
+    def _start(self):
+        self.cap, _ = find_active_camera(RESOLUTION[0], RESOLUTION[1])
+        if self.cap:
+            threading.Thread(target=self._capture_loop, daemon=True).start()
+        else:
+            logging.error("No camera found on any index!")
+
+    def _capture_loop(self):
+        while self.running and self.cap and self.cap.isOpened():
+            ret, frame_bgr = self.cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+                # If AI is active, process here (no motor sleeps inside)
+                with ai_tracking_lock:
+                    active = ai_tracking_active
+
+                if active:
+                    mask, detection = get_mask_and_detection(frame_rgb)
+                else:
+                    mask, detection = None, None
+
+                with self.lock:
+                    self.latest_frame = frame_bgr.copy()
+                    self.latest_mask = mask
+                    self.latest_det = detection
+
+            time.sleep(0.01)  # limit CPU usage
+
+    def get_latest_frame(self):
+        """Return latest BGR frame or blank"""
+        with self.lock:
+            if self.latest_frame is None:
+                blank = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), np.uint8)
+                cv2.putText(blank, "NO CAMERA", (80, RESOLUTION[1] // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
+                return blank
+            return self.latest_frame.copy()
+
+    def get_latest_processed(self):
+        """Return (frame_bgr, mask_gray or None, det_bgr or None)"""
+        with self.lock:
+            frame = self.latest_frame.copy() if self.latest_frame is not None else None
+            mask = self.latest_mask.copy() if self.latest_mask is not None else None
+            det = self.latest_det.copy() if self.latest_det is not None else None
+            return frame, mask, det
+
+    def release(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+
+
+camera = CameraManager()
+
+
+class Servo:
+    MIN_PULSE_NS = 500_000
+    MAX_PULSE_NS = 2_500_000
+    FREQ = 50
+
+    def __init__(self, physical_pin):
+        if physical_pin not in PWM_PINS:
+            raise ValueError(f"Pin {physical_pin} is not PWM Pin")
+
+        info = PWM_PINS[physical_pin]
+        self.pin = physical_pin
+        self.name = info["name"]
+        self.chip = info["chip"]
+        self.channel = info["channel"]
+        self.period_ns = 1_000_000_000 // self.FREQ
+        self.chip_path = f"/sys/class/pwm/pwmchip{self.chip}"
+        self.pwm_path = f"{self.chip_path}/pwm{self.channel}"
+        self._angle = 0.0
+        self._ok = False
+        self._init()
+
+    def _write(self, path, value):
+        with open(path, 'w') as f:
+            f.write(str(value))
+
+    def _init(self):
+        if not os.path.exists(self.chip_path):
+            print(f"[error] {self.chip_path} not exis  烾儘urn on the PWM overlay and restart")
+            sys.exit(1)
+
+        if not os.path.exists(self.pwm_path):
+            self._write(f"{self.chip_path}/export", self.channel)
+            time.sleep(0.2)
+
+        try:
+            self._write(f"{self.pwm_path}/enable", 0)
+        except Exception:
+            pass
+        try:
+            self._write(f"{self.pwm_path}/polarity", "normal")
+        except Exception:
+            pass
+
+        self._write(f"{self.pwm_path}/period", self.period_ns)
+        time.sleep(0.05) #0.05
+        self._write(f"{self.pwm_path}/duty_cycle", 0)
+        self._write(f"{self.pwm_path}/enable", 1)
+        self._ok = True
+        print(f"  Pin{self.pin} ({self.name}) is ready")
+
+    def set_angle(self, angle):
+        angle = max(0.0, min(180.0, float(angle)))
+        duty = int(self.MIN_PULSE_NS + (self.MAX_PULSE_NS - self.MIN_PULSE_NS) * angle / 180.0)
+        self._write(f"{self.pwm_path}/duty_cycle", duty)
+        self._angle = angle
+
+    def cleanup(self):
+        if self._ok:
+            try:
+                self._write(f"{self.pwm_path}/duty_cycle", 0)
+                time.sleep(0.05)
+                self._write(f"{self.pwm_path}/enable", 0)
+                self._write(f"{self.chip_path}/unexport", self.channel)
+            except Exception:
+                pass
+            self._ok = False
+
+
+pins = [16, 33, 32]
+servos = [Servo(pin) for pin in pins]
+
+
+# --- Smooth servo motion ---
+def move_servos_smooth(servo_targets, duration):
+    if duration <= 0.0:
+        for s, angle in servo_targets:
+            s.set_angle(angle)
+        return
+
+    step_time = 0.02  # 20ms per step (50Hz updates)
+    steps = max(1, int(duration / step_time))
+
+    # Pre-calculate increments for each servo
+    increments = []
+    for s, angle in servo_targets:
+        target = max(0.0, min(180.0, float(angle)))
+        start = s._angle
+        inc = (target - start) / steps
+        increments.append((s, start, inc))
+
+    # Execute the steps
+    for i in range(1, steps + 1):
+        for s, start, inc in increments:
+            s.set_angle(start + i * inc)
+        time.sleep(step_time)
+
+
+def setLR(l, r):
+    # Move the side fins smoothly over a quick 0.1s
+    move_servos_smooth([(servos[1], 90 + l), (servos[2], 90 + r)], 0.3)
+
+
+def reset(servos_list):
+    # Smoothly return all servos to center over 0.5s instead of snapping instantly
+    targets = [(s, 90) for s in servos_list]
+    move_servos_smooth(targets, 1)
+
+
+#reset(servos)
+
+
+def motor(l, r, c):
+    global move_speed, motor_speed
+    setLR(l, r)
+
+    if c == "forward":
+        move_servos_smooth([(servos[0], 150)], motor_speed)
+        move_servos_smooth([(servos[0], 30)], motor_speed)
+    elif c == "left":
+        move_servos_smooth([(servos[0], 180)], motor_speed)
+        move_servos_smooth([(servos[0], 90)], motor_speed)
+    elif c == "right":
+        move_servos_smooth([(servos[0], 90)], motor_speed)
+        move_servos_smooth([(servos[0], 0)], motor_speed)
+
+
+
+def forward():
+    global forward_moving, move_speed
+    while True:
+        with forward_lock:
+            if not forward_moving: reset(servos); break;
+        move_servos_smooth([(servos[0], 140)], move_speed)
+        move_servos_smooth([(servos[0], 40)], move_speed)
+
+
+def joystick_move(l, r, tail_mode):
+    global move_speed
+    setLR(l, r)
+
+    if tail_mode == "left":
+        move_servos_smooth([(servos[0], 170)], move_speed-0.1)
+        move_servos_smooth([(servos[0], 70)], move_speed-0.1)
+    elif tail_mode == "right":
+        move_servos_smooth([(servos[0], 110)], move_speed-0.1)
+        move_servos_smooth([(servos[0], 10)], move_speed-0.1)
+    elif tail_mode == "forward":
+        move_servos_smooth([(servos[0], 140)], move_speed-0.1)
+        move_servos_smooth([(servos[0], 40)], move_speed-0.1)
+
+    reset(servos)
+
+
+def joystick_loop():
+    global joystick_active, joystick_direction, move_speed
+    print("Joystick Loop Started")
+    while True:
+        with joystick_lock:
+            if not joystick_active:
+                reset(servos)
+                break
+            current_dir = joystick_direction
+
+        if current_dir:
+            if current_dir == 'up':
+                joystick_move(-50, 50, 'forward')
+            elif current_dir == 'down':
+                joystick_move(50, -50, 'forward')
+            elif current_dir == 'left':
+                joystick_move(0, 0, 'left')
+            elif current_dir == 'right':
+                joystick_move(0, 0, 'right')
+            elif current_dir == 'up_left':
+                joystick_move(-50, 50, 'left')
+            elif current_dir == 'up_right':
+                joystick_move(-50, 50, 'right')
+            elif current_dir == 'down_left':
+                joystick_move(50, -50, 'left')
+            elif current_dir == 'down_right':
+                joystick_move(50, -50, 'right')
+        else:
+            time.sleep(0.1)
+    print("Joystick Loop Stopped")
+
+
+# --- MOTOR WORKER THREAD (for AI commands) ---
+def motor_worker():
+    global motor_worker_running
+    print("Motor worker started.")
+    while motor_worker_running:
+        try:
+            cmd = motor_queue.get(timeout=0.4)
+        except Empty:
+            continue
+
+        if cmd is None:
+            break
+
+        l, r, c = cmd
+        motor(l, r, c)
+
+    print("Motor worker stopped.")
+    #reset(servos)
+
+
+# Start motor worker thread
+threading.Thread(target=motor_worker, daemon=True).start()
+
+
+def enqueue_motor_command(l, r, c):
+    try:
+        motor_queue.put_nowait((l, r, c))
+    except:
+        pass
+
+
+def get_mask_and_detection(frame_rgb):
+    """
+    Image processing + AI decision.
+    Enqueues motor commands instead of calling motor() directly.
+    """
+    global last_motor_time, motor_speed
+
+    frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Build mask for red
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in multi_thresholds:
+        mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+
+    # Clean up mask to reduce noise
+    kerne13 = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kerne13)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kerne13)
+
+    # Find largest contour
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    largest_contour = None
+    largest_area = 0
+    center = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > 490 and area > largest_area:
+            largest_area = area
+            largest_contour = c
+            print(area)
+            
+
+    detection = frame.copy()
+    h, w = frame.shape[:2]
+
+    # Draw grid
+    cv2.line(detection, (w // 3, 0), (w // 3, h), (0, 255, 0), 1)
+    cv2.line(detection, (2 * w // 3, 0), (2 * w // 3, h), (0, 255, 0), 1)
+    cv2.line(detection, (0, h // 3), (w, h // 3), (0, 255, 0), 1)
+    cv2.line(detection, (0, 2 * h // 3), (w, 2 * h // 3), (0, 255, 0), 1)
+
+    if largest_contour is not None:
+        cv2.drawContours(detection, [largest_contour], -1, (255, 255, 255), 3)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            center = (cx, cy)
+            cv2.circle(detection, center, 6, (0, 0, 255), -1)
+
+    with ai_tracking_lock:
+        active = ai_tracking_active
+
+    if active and center and time.time() - last_motor_time > motor_cooldown:
+        x, y = center
+
+
+        # horizontal region
+        if x < w // 3:
+            horiz = "left"
+        elif x > 2 * w // 3:
+            horiz = "right"
+        else:
+            horiz = "middle"
+
+        # vertical region
+        if y < h // 3:
+            vert = "upper"
+        elif y > 2 * h // 3:
+            vert = "lower"
+        else:
+            vert = "middle"
+
+        region = f"{vert} {horiz}"
+        print(f"Detected in {region} region")
+
+        # 9-region mapping
+        if region == "upper left":
+            enqueue_motor_command(-60, 60, 'left')
+        elif region == "upper middle":
+            enqueue_motor_command(-60, 60, 'forward')
+        elif region == "upper right":
+            enqueue_motor_command(-60, 60, 'right')
+        elif region == "middle left":
+            enqueue_motor_command(0, 0, 'left')
+        elif region == "middle middle":
+            enqueue_motor_command(0, 0, 'forward')
+        elif region == "middle right":
+            enqueue_motor_command(0, 0, 'right')
+        elif region == "lower left":
+            enqueue_motor_command(60, -60, 'left')
+        elif region == "lower middle":
+            enqueue_motor_command(60, -60, 'forward')
+        elif region == "lower right":
+            enqueue_motor_command(60, -60, 'right')
+
+        last_motor_time = time.time()
+        
+
+    return mask, detection
+
+
+def gen_original():
+    while True:
+        frame_bgr = camera.get_latest_frame()
+        ret, buffer = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if ret:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        sleep(0.03)
+
+
+def gen_detection():
+    while True:
+        frame_bgr, mask, det = camera.get_latest_processed()
+
+        if det is None:
+            frame_bgr = camera.get_latest_frame()
+            det = frame_bgr
+
+        ret, buffer = cv2.imencode('.jpg', det, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if ret:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        sleep(0.03)
+
+
+def gen_mask():
+    while True:
+        frame_bgr, mask, det = camera.get_latest_processed()
+
+        if mask is None:
+            blank = np.zeros((RESOLUTION[1], RESOLUTION[0], 3), np.uint8)
+            img = blank
+        else:
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            img = mask_bgr
+
+        ret, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if ret:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        sleep(0.03)
+
+
+def record_video():
+    global recording_active
+    print("Recording thread started.")
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(video_filename, fourcc, fps, frame_size)
+    while True:
+        with recording_lock:
+            if not recording_active:
+                break
+        frame_bgr = camera.get_latest_frame()
+        out.write(frame_bgr)
+        time.sleep(1.0 / fps)
+    out.release()
+    print(f"Recording stopped. Video saved as {video_filename}")
+
+
+@app.route('/')
+def index():
+    return render_template('index2.html')
+
+
+@app.route('/video_feed_original')
+def video_feed_original():
+    return Response(gen_original(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/video_feed_detection')
+def video_feed_detection():
+    return Response(gen_detection(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/video_feed_mask')
+def video_feed_mask():
+    return Response(gen_mask(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/toggle_ai', methods=['POST'])
+def toggle_ai():
+    global ai_tracking_active
+    with ai_tracking_lock:
+        ai_tracking_active = not ai_tracking_active
+    return jsonify({'ai_tracking_active': ai_tracking_active})
+
+
+@app.route('/move', methods=['POST'])
+def move():
+    global forward_moving, move_speed, joystick_active, joystick_direction
+    data = request.get_json()
+    command = data.get('command')
+
+    if command == 'accelerate':
+        move_speed = max(0.1, round(move_speed - 0.1, 1))
+        return jsonify({'status': 'ok', 'speed': move_speed})
+    elif command == 'decelerate':
+        move_speed = min(1.0, round(move_speed + 0.1, 1))
+        return jsonify({'status': 'ok', 'speed': move_speed})
+    elif command == 'toggle_run':
+        with joystick_lock:
+            joystick_active = False
+        with forward_lock:
+            if not forward_moving:
+                forward_moving = True
+                threading.Thread(target=forward, daemon=True).start()
+            else:
+                forward_moving = False
+        return jsonify({'status': 'success', 'forward_moving': forward_moving})
+    elif command == 'stop':
+        with joystick_lock:
+            joystick_active = False
+            joystick_direction = None
+        return jsonify({'status': 'stopped'})
+    else:
+        if forward_moving:
+            forward_moving = False
+        with joystick_lock:
+            joystick_direction = command
+            if not joystick_active:
+                joystick_active = True
+                threading.Thread(target=joystick_loop, daemon=True).start()
+        return jsonify({'status': 'moving', 'dir': command})
+
+
+@app.route('/record', methods=['POST'])
+def record():
+    global recording_active
+    with recording_lock:
+        if not recording_active:
+            recording_active = True
+            threading.Thread(target=record_video, daemon=True).start()
+            return jsonify({'status': 'started'})
+        else:
+            recording_active = False
+            return jsonify({'status': 'stopped'})
+
+
+if __name__ == '__main__':
+    try:
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    finally:
+        # Stop motor worker cleanly
+        motor_worker_running = False
+        try:
+            motor_queue.put_nowait(None)
+        except:
+            pass
+        camera.release()
